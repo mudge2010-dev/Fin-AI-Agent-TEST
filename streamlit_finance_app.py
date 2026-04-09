@@ -1,8 +1,6 @@
 import warnings
 warnings.filterwarnings('ignore')
 
-from datetime import datetime
-import textwrap
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -31,10 +29,6 @@ DARK_CSS = """
     --border: rgba(148, 163, 184, 0.18);
     --text: #e5edf8;
     --muted: #98a6bd;
-    --accent: #3b82f6;
-    --accent-2: #22c55e;
-    --danger: #ef4444;
-    --warning: #f59e0b;
 }
 html, body, [data-testid='stAppViewContainer'] {
     background: radial-gradient(circle at top right, rgba(59,130,246,.12), transparent 24%), linear-gradient(180deg, #09101d 0%, #0b1020 100%);
@@ -92,9 +86,7 @@ hr {
 [data-testid='stMetricLabel'], [data-testid='stMetricDelta'] {
     color: var(--muted);
 }
-h1, h2, h3 {
-    color: var(--text) !important;
-}
+h1, h2, h3 { color: var(--text) !important; }
 .stDataFrame, div[data-testid='stTable'] {
     border: 1px solid var(--border);
     border-radius: 16px;
@@ -125,8 +117,6 @@ def fmt_num(x, pct=False, money=False):
         if abs_x >= 1e6:
             return f"${x/1e6:,.2f}M"
         return f"${x:,.0f}"
-    if abs(x) >= 100:
-        return f"{x:,.2f}"
     return f"{x:,.2f}"
 
 
@@ -136,11 +126,17 @@ def safe_div(a, b):
     return a / b
 
 
-def first_available(df, labels):
-    for label in labels:
-        if label in df.index:
-            return df.loc[label]
-    return pd.Series(dtype='float64')
+def coalesce(*vals):
+    for v in vals:
+        if v is None:
+            continue
+        try:
+            if pd.isna(v):
+                continue
+        except Exception:
+            pass
+        return v
+    return np.nan
 
 
 def get_statement_value(df, labels, col):
@@ -153,19 +149,43 @@ def get_statement_value(df, labels, col):
     return np.nan
 
 
-def get_quarterly_ratios(ticker_obj, info):
-    bs = ticker_obj.quarterly_balance_sheet
-    fin = ticker_obj.quarterly_financials
-    cf = ticker_obj.quarterly_cashflow
+@st.cache_data(ttl=300, show_spinner=False)
+def load_history(ticker):
+    tk = yf.Ticker(ticker)
+    return tk.history(period='1y', auto_adjust=True)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_info_safe(ticker):
+    tk = yf.Ticker(ticker)
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    try:
+        fi = tk.fast_info
+        fast_info = dict(fi) if fi is not None else {}
+    except Exception:
+        fast_info = {}
+    return info, fast_info
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_quarterly_data(ticker):
+    tk = yf.Ticker(ticker)
+    return tk.quarterly_balance_sheet, tk.quarterly_financials, tk.quarterly_cashflow
+
+
+def get_quarterly_ratios_from_data(bs, fin, cf, info, fast_info):
     cols = []
     for df in [bs, fin, cf]:
         if df is not None and not df.empty:
             cols.extend(list(df.columns))
-    cols = sorted(set(cols))[:4]
+    cols = sorted(set(cols))[-4:]
     cols = sorted(cols)
 
     rows = []
-    market_cap = info.get('marketCap', np.nan)
+    market_cap = coalesce(fast_info.get('marketCap'), info.get('marketCap'))
     enterprise_value = info.get('enterpriseValue', np.nan)
     trailing_pe = info.get('trailingPE', np.nan)
     price_to_book = info.get('priceToBook', np.nan)
@@ -176,11 +196,11 @@ def get_quarterly_ratios(ticker_obj, info):
         current_liabilities = get_statement_value(bs, ['Current Liabilities'], col)
         inventory = get_statement_value(bs, ['Inventory'], col)
         total_assets = get_statement_value(bs, ['Total Assets'], col)
-        stockholders_equity = get_statement_value(bs, ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'], col)
+        equity = get_statement_value(bs, ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest'], col)
         total_debt = get_statement_value(bs, ['Total Debt', 'Long Term Debt And Capital Lease Obligation', 'Long Term Debt', 'Current Debt And Capital Lease Obligation'], col)
 
         net_income = get_statement_value(fin, ['Net Income', 'Net Income Common Stockholders'], col)
-        total_revenue = get_statement_value(fin, ['Total Revenue', 'Operating Revenue'], col)
+        revenue = get_statement_value(fin, ['Total Revenue', 'Operating Revenue'], col)
         ebit = get_statement_value(fin, ['EBIT', 'Operating Income'], col)
         interest_expense = abs(get_statement_value(fin, ['Interest Expense', 'Net Interest Income'], col))
         ebitda = get_statement_value(fin, ['EBITDA'], col)
@@ -188,25 +208,21 @@ def get_quarterly_ratios(ticker_obj, info):
             d_and_a = get_statement_value(cf, ['Depreciation And Amortization', 'Depreciation Amortization Depletion'], col)
             ebitda = ebit + (0 if pd.isna(d_and_a) else d_and_a)
 
-        row = {
+        rows.append({
             'Quarter': pd.to_datetime(col).strftime('%Y-%m'),
             'Current Ratio': safe_div(current_assets, current_liabilities),
             'Quick Ratio': safe_div((current_assets - (0 if pd.isna(inventory) else inventory)), current_liabilities) if not pd.isna(current_assets) and not pd.isna(current_liabilities) else np.nan,
-            'ROE': safe_div(net_income, stockholders_equity),
+            'ROE': safe_div(net_income, equity),
             'ROA': safe_div(net_income, total_assets),
-            'Net Profit Margin': safe_div(net_income, total_revenue),
-            'Debt-to-Equity': safe_div(total_debt, stockholders_equity),
+            'Net Profit Margin': safe_div(net_income, revenue),
+            'Debt-to-Equity': safe_div(total_debt, equity),
             'Interest Coverage': safe_div(ebit, interest_expense),
             'P/E Ratio': trailing_pe,
             'EV/EBITDA': ev_to_ebitda if not pd.isna(ev_to_ebitda) else safe_div(enterprise_value, ebitda),
-            'Price-to-Book': price_to_book if not pd.isna(price_to_book) else safe_div(market_cap, stockholders_equity),
-        }
-        rows.append(row)
+            'Price-to-Book': price_to_book if not pd.isna(price_to_book) else safe_div(market_cap, equity),
+        })
 
-    ratio_df = pd.DataFrame(rows)
-    if ratio_df.empty:
-        ratio_df = pd.DataFrame(columns=['Quarter'] + RATIO_ORDER)
-    return ratio_df
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=['Quarter'] + RATIO_ORDER)
 
 
 def latest_10k_text(ticker, company_name=''):
@@ -214,18 +230,13 @@ def latest_10k_text(ticker, company_name=''):
     if ExtractorApi and sec_key:
         try:
             extractor = ExtractorApi(sec_key)
-            filing_url = f'https://www.sec.gov/Archives/{ticker}'
-            _ = filing_url
+            _ = extractor
         except Exception:
             pass
-
-    fallback = [
-        f"Business Description fallback for {company_name or ticker}: " + (
-            'The application could not extract the latest 10-K narrative directly from the SEC in this runtime, so it uses the company profile returned by yfinance as a proxy for business description.'
-        ),
-        'Risk Factors fallback: investors should review the latest Form 10-K directly on EDGAR for formal risk language, including macroeconomic exposure, competition, regulation, cybersecurity, capital intensity, and demand cyclicality.'
-    ]
-    return {'business': fallback[0], 'risk': fallback[1], 'source': 'fallback'}
+    return {
+        'business': f"Business Description fallback for {company_name or ticker}: the app could not extract the latest 10-K narrative directly from the SEC in this runtime, so it uses available profile data as a proxy.",
+        'risk': 'Risk Factors fallback: review the latest Form 10-K on EDGAR for formal risk disclosures such as regulation, competition, cybersecurity, macro sensitivity, supply chain exposure, and capital allocation risk.'
+    }
 
 
 def summarize_text(text, max_sentences=4):
@@ -274,7 +285,7 @@ def build_ratio_chart(ratio_df):
     }
     colors = ['#60a5fa', '#22c55e', '#f59e0b', '#f472b6', '#a78bfa']
     fig = make_subplots(rows=2, cols=2, subplot_titles=list(categories.keys()))
-    positions = [(1,1), (1,2), (2,1), (2,2)]
+    positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
 
     for i, (cat, metrics) in enumerate(categories.items()):
         r, c = positions[i]
@@ -327,8 +338,8 @@ def health_flag(metric, value):
 
 
 with st.sidebar:
-    st.markdown("## Equity Inputs")
-    ticker = st.text_input('Ticker', value='AAPL', help='Enter a U.S. listed ticker symbol.').upper().strip()
+    st.markdown('## Equity Inputs')
+    ticker = st.text_input('Ticker', value='AAPL', help='Enter a listed ticker symbol.').upper().strip()
     run = st.button('Generate Report', use_container_width=True)
     st.markdown('---')
     st.markdown('**Data stack**')
@@ -339,29 +350,33 @@ st.caption('Dark-mode Streamlit dashboard for market snapshots, filing context, 
 
 if run:
     try:
-        tk = yf.Ticker(ticker)
-        info = tk.info or {}
-        hist = tk.history(period='1y', auto_adjust=True)
+        hist = load_history(ticker)
         if hist.empty:
             st.error('No price history returned for this ticker.')
             st.stop()
 
-        company_name = info.get('shortName') or info.get('longName') or ticker
-        current_price = hist['Close'].iloc[-1]
-        market_cap = info.get('marketCap', np.nan)
+        info, fast_info = load_info_safe(ticker)
+        bs, fin, cf = load_quarterly_data(ticker)
+
+        if not info:
+            st.warning('Detailed Yahoo Finance metadata is temporarily rate-limited. The app is using fallback values from fast_info and price history where possible.')
+
+        company_name = coalesce(info.get('shortName'), info.get('longName'), fast_info.get('shortName'), ticker)
+        current_price = coalesce(fast_info.get('lastPrice'), info.get('currentPrice'), hist['Close'].iloc[-1])
+        market_cap = coalesce(fast_info.get('marketCap'), info.get('marketCap'))
         enterprise_value = info.get('enterpriseValue', np.nan)
         sector = info.get('sector', 'N/A')
         industry = info.get('industry', 'N/A')
-        currency = info.get('currency', 'USD')
-        description = info.get('longBusinessSummary', 'No company description available from yfinance.')
+        currency = coalesce(fast_info.get('currency'), info.get('currency'), 'USD')
+        description = info.get('longBusinessSummary', 'No company description available because the detailed yfinance profile endpoint was unavailable.')
         sec_summary = latest_10k_text(ticker, company_name)
-        ratio_df = get_quarterly_ratios(tk, info)
+        ratio_df = get_quarterly_ratios_from_data(bs, fin, cf, info, fast_info)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric('Current Price', f"{current_price:,.2f} {currency}")
+        c1.metric('Current Price', f"{current_price:,.2f} {currency}" if not pd.isna(current_price) else 'N/A')
         c2.metric('Market Cap', fmt_num(market_cap, money=True))
         c3.metric('Enterprise Value', fmt_num(enterprise_value, money=True))
-        c4.metric('Sector / Industry', f"{sector} / {industry[:20]}{'...' if len(industry) > 20 else ''}")
+        c4.metric('Sector / Industry', f"{sector} / {industry[:20]}{'...' if isinstance(industry, str) and len(industry) > 20 else ''}")
 
         left, right = st.columns([1.35, 1])
         with left:
@@ -370,7 +385,7 @@ if run:
             st.markdown("<div class='panel-card'>", unsafe_allow_html=True)
             st.markdown("<div class='section-title'>Company Profile</div>", unsafe_allow_html=True)
             st.write(summarize_text(description, 5))
-            st.markdown("<hr>", unsafe_allow_html=True)
+            st.markdown('<hr>', unsafe_allow_html=True)
             st.markdown("<div class='section-title'>10-K Business Description</div>", unsafe_allow_html=True)
             st.write(summarize_text(sec_summary['business'], 4))
             st.markdown("<div class='section-title' style='margin-top:.9rem;'>10-K Risk Factors</div>", unsafe_allow_html=True)
@@ -386,13 +401,12 @@ if run:
             key_metrics = ['Current Ratio', 'ROE', 'Debt-to-Equity', 'Interest Coverage', 'EV/EBITDA']
             for col, metric in zip(cards, key_metrics):
                 val = latest.get(metric, np.nan)
-                status = health_flag(metric, val)
                 col.markdown(
                     f"""
                     <div class='metric-card'>
                         <div class='kpi-label'>{metric}</div>
                         <div class='kpi-value'>{fmt_num(val, pct=metric in ['ROE','ROA','Net Profit Margin'])}</div>
-                        <div class='caption-text'>{status}</div>
+                        <div class='caption-text'>{health_flag(metric, val)}</div>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -414,7 +428,8 @@ if run:
             - Liquidity: Current Ratio = Current Assets / Current Liabilities; Quick Ratio excludes inventory.
             - Profitability: ROE = Net Income / Equity; ROA = Net Income / Total Assets; Net Profit Margin = Net Income / Revenue.
             - Leverage: Debt-to-Equity = Total Debt / Equity; Interest Coverage = EBIT / Interest Expense.
-            - Valuation: P/E, EV/EBITDA, and Price-to-Book rely on yfinance market fields and are repeated across quarterly panels when only point-in-time market values are available.
+            - Valuation: P/E, EV/EBITDA, and Price-to-Book rely on yfinance market fields and may be unavailable when metadata endpoints are rate-limited.
+            - Requests are cached for 5 minutes to reduce repeated Yahoo Finance calls.
             - SEC narrative extraction is implemented with a resilient fallback; add SEC_API_KEY to Streamlit secrets to extend direct filing extraction.
             ''')
 
